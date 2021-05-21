@@ -50,7 +50,7 @@
 		// Run the entrypoint defined in container image.
 		"--init"
 	],
-	"postCreateCommand": "if [ ! -d /go/src/github.com/dapr/dapr/.git ]; then git clone https://github.com/dapr/dapr /go/src/github.com/dapr/dapr; fi",
+	"postCreateCommand": "bash /usr/local/etc/vscode-dev-containers/dapr-dev-scripts/init-gopath.sh",
 	"settings": {
 		"terminal.integrated.defaultProfile.linux": "bash",
 	},
