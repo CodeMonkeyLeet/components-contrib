@@ -7,12 +7,12 @@ name: Components Conformance Tests
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: '*/30 * * * *'
-  pull_request:
-    branches:
-      - master
-      - release-*
+  # schedule:
+  #   - cron: '*/30 * * * *'
+  # pull_request:
+  #   branches:
+  #     - master
+  #     - release-*
 
 jobs:
   pre_job:
