@@ -27,7 +27,7 @@ components:
     operations: ["create", "operations", "read"]
     config:
       readBindingTimeout: 240s
-      readBindingWait: 8s
+      readBindingWait: 15s
   - component: azure.storagequeues
     operations: ["create", "operations", "read"]
   - component: azure.servicebusqueues

@@ -11,6 +11,7 @@ import (
 	"crypto/x509"
 	"encoding/pem"
 	"fmt"
+	"log"
 	"net/url"
 	"os"
 	"os/signal"
@@ -167,6 +168,12 @@ func (m *MQTT) Init(metadata bindings.Metadata) error {
 	if err != nil {
 		return err
 	}
+
+	// DEBUG: Enable MQTT internal logging
+	mqtt.ERROR = log.New(os.Stdout, "[ERROR] ", 0)
+	mqtt.CRITICAL = log.New(os.Stdout, "[CRIT] ", 0)
+	mqtt.WARN = log.New(os.Stdout, "[WARN]  ", 0)
+	mqtt.DEBUG = log.New(os.Stdout, "[DEBUG] ", 0)
 
 	m.ctx, m.cancel = context.WithCancel(context.Background())
 
