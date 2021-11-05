@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io/ioutil"
+	"net"
 	"time"
 
 	"github.com/Azure/azure-sdk-for-go/services/preview/eventgrid/mgmt/2020-04-01-preview/eventgrid"
@@ -72,11 +73,6 @@ func (a *AzureEventGrid) Read(handler func(*bindings.ReadResponse) ([]byte, erro
 		return err
 	}
 
-	err = a.createSubscription()
-	if err != nil {
-		return err
-	}
-
 	m := func(ctx *fasthttp.RequestCtx) {
 		if string(ctx.Path()) == "/api/events" {
 			switch string(ctx.Method()) {
@@ -102,13 +98,36 @@ func (a *AzureEventGrid) Read(handler func(*bindings.ReadResponse) ([]byte, erro
 		}
 	}
 
-	a.logger.Debugf("About to start listening for Event Grid events at http://localhost:%s/api/events", a.metadata.HandshakePort)
-	err = fasthttp.ListenAndServe(fmt.Sprintf(":%s", a.metadata.HandshakePort), m)
+	// Start HTTP listener for handling events.
+	ch := make(chan error)
+	go func(m func(ctx *fasthttp.RequestCtx)) {
+		defer close(ch)
+		a.logger.Debugf("About to start listening for Event Grid events at http://localhost:%s/api/events", a.metadata.HandshakePort)
+		err := fasthttp.ListenAndServe(fmt.Sprintf(":%s", a.metadata.HandshakePort), m)
+		ch <- err
+	}(m)
+
+	// Wait for HTTP server to be running before creating subscription with Azure EventGrid.
+	a.logger.Debugf("Waiting on http://localhost:%s/api/events to be ready...", a.metadata.HandshakePort)
+	for {
+		conn, _ := net.DialTimeout("tcp", net.JoinHostPort("localhost", fmt.Sprintf("%v", a.metadata.HandshakePort)), 500*time.Millisecond)
+		if conn != nil {
+			conn.Close()
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	a.logger.Debugf("Successfully dialed http://localhost:%s/api/events", a.metadata.HandshakePort)
+
+	err = a.createSubscription()
 	if err != nil {
 		return err
 	}
 
-	return nil
+	// Block on ListenAndServe and return any errors when blocking Read is terminated.
+	err = <-ch
+
+	return err
 }
 
 func (a *AzureEventGrid) Operations() []bindings.OperationKind {
