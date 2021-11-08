@@ -14,7 +14,9 @@ import (
 	"log"
 	"net/url"
 	"os"
+	"os/signal"
 	"strconv"
+	"syscall"
 	"time"
 
 	"github.com/cenkalti/backoff/v4"
@@ -22,6 +24,7 @@ import (
 
 	"github.com/dapr/components-contrib/bindings"
 	"github.com/dapr/kit/logger"
+	"github.com/dapr/kit/retry"
 )
 
 const (
@@ -190,104 +193,112 @@ func (m *MQTT) Operations() []bindings.OperationKind {
 }
 
 func (m *MQTT) Invoke(req *bindings.InvokeRequest) (*bindings.InvokeResponse, error) {
-	m.logger.Debugf("mqtt publishing topic %s with data: %v", m.metadata.topic, req.Data)
+	cbo := backoff.NewConstantBackOff(200 * time.Millisecond)
+	bo := backoff.WithMaxRetries(cbo, 3)
+	bo = backoff.WithContext(bo, m.ctx)
 
-	token := m.producer.Publish(m.metadata.topic, m.metadata.qos, m.metadata.retain, req.Data)
-	if !token.WaitTimeout(defaultWait) || token.Error() != nil {
-		return nil, fmt.Errorf("mqtt error from publish: %v", token.Error())
-	}
-
-	return nil, nil
+	return nil, retry.NotifyRecover(func() error {
+		m.logger.Debugf("mqtt publishing topic %s with data: %v", m.metadata.topic, req.Data)
+		token := m.producer.Publish(m.metadata.topic, m.metadata.qos, m.metadata.retain, req.Data)
+		if !token.WaitTimeout(defaultWait) || token.Error() != nil {
+			return fmt.Errorf("mqtt error from publish: %v", token.Error())
+		}
+		return nil
+	}, bo, func(err error, _ time.Duration) {
+		m.logger.Debugf("Could not publish MQTT message. Retrying...: %v", err)
+	}, func() {
+		m.logger.Debug("Successfully published MQTT message after it previously failed")
+	})
 }
 
-// func (m *MQTT) handleMessage(handler func(*bindings.ReadResponse) ([]byte, error), mqttMsg mqtt.Message) error {
-// 	msg := bindings.ReadResponse{Data: mqttMsg.Payload()}
+func (m *MQTT) handleMessage(handler func(*bindings.ReadResponse) ([]byte, error), mqttMsg mqtt.Message) error {
+	msg := bindings.ReadResponse{Data: mqttMsg.Payload()}
 
-// 	// paho.mqtt.golang requires that handlers never block or it can deadlock on client.Disconnect.
-// 	// To ensure that the Dapr runtime does not hang on teardown on of the component, run the app's
-// 	// handling code in a goroutine so that this handler function is always cancellable on Close().
-// 	ch := make(chan error)
-// 	go func(m *bindings.ReadResponse) {
-// 		defer close(ch)
-// 		_, err := handler(m)
-// 		ch <- err
-// 	}(&msg)
+	// paho.mqtt.golang requires that handlers never block or it can deadlock on client.Disconnect.
+	// To ensure that the Dapr runtime does not hang on teardown on of the component, run the app's
+	// handling code in a goroutine so that this handler function is always cancellable on Close().
+	ch := make(chan error)
+	go func(m *bindings.ReadResponse) {
+		defer close(ch)
+		_, err := handler(m)
+		ch <- err
+	}(&msg)
 
-// 	select {
-// 	case handlerErr := <-ch:
-// 		if handlerErr != nil {
-// 			return handlerErr
-// 		}
-// 		mqttMsg.Ack()
-// 		return nil
-// 	case <-m.ctx.Done():
-// 		m.logger.Infof("Read context cancelled: %v", m.ctx.Err())
-// 		return m.ctx.Err()
-// 	}
-// }
+	select {
+	case handlerErr := <-ch:
+		if handlerErr != nil {
+			return handlerErr
+		}
+		mqttMsg.Ack()
+		return nil
+	case <-m.ctx.Done():
+		m.logger.Infof("Read context cancelled: %v", m.ctx.Err())
+		return m.ctx.Err()
+	}
+}
 
-// func (m *MQTT) Read(handler func(*bindings.ReadResponse) ([]byte, error)) error {
-// 	sigterm := make(chan os.Signal, 1)
-// 	signal.Notify(sigterm, os.Interrupt, syscall.SIGTERM)
+func (m *MQTT) Read(handler func(*bindings.ReadResponse) ([]byte, error)) error {
+	sigterm := make(chan os.Signal, 1)
+	signal.Notify(sigterm, os.Interrupt, syscall.SIGTERM)
 
-// 	// reset synchronization
-// 	if m.consumer != nil {
-// 		m.logger.Warnf("re-initializing the subscriber")
-// 		m.consumer.Disconnect(0)
-// 		m.consumer = nil
-// 	}
+	// reset synchronization
+	if m.consumer != nil {
+		m.logger.Warnf("re-initializing the subscriber")
+		m.consumer.Disconnect(0)
+		m.consumer = nil
+	}
 
-// 	// mqtt broker allows only one connection at a given time from a clientID.
-// 	consumerClientID := fmt.Sprintf("%s-consumer", m.metadata.clientID)
-// 	c, err := m.connect(consumerClientID)
-// 	if err != nil {
-// 		return err
-// 	}
-// 	m.consumer = c
+	// mqtt broker allows only one connection at a given time from a clientID.
+	consumerClientID := fmt.Sprintf("%s-consumer", m.metadata.clientID)
+	c, err := m.connect(consumerClientID)
+	if err != nil {
+		return err
+	}
+	m.consumer = c
 
-// 	m.logger.Debugf("mqtt subscribing to topic %s", m.metadata.topic)
-// 	token := m.consumer.Subscribe(m.metadata.topic, m.metadata.qos, func(client mqtt.Client, mqttMsg mqtt.Message) {
-// 		b := m.backOff
-// 		if m.metadata.backOffMaxRetries >= 0 {
-// 			b = backoff.WithMaxRetries(m.backOff, uint64(m.metadata.backOffMaxRetries))
-// 		}
+	m.logger.Debugf("mqtt subscribing to topic %s", m.metadata.topic)
+	token := m.consumer.Subscribe(m.metadata.topic, m.metadata.qos, func(client mqtt.Client, mqttMsg mqtt.Message) {
+		b := m.backOff
+		if m.metadata.backOffMaxRetries >= 0 {
+			b = backoff.WithMaxRetries(m.backOff, uint64(m.metadata.backOffMaxRetries))
+		}
 
-// 		if err := retry.NotifyRecover(func() error {
-// 			m.logger.Debugf("Processing MQTT message %s/%d", mqttMsg.Topic(), mqttMsg.MessageID())
-// 			return m.handleMessage(handler, mqttMsg)
-// 		}, b, func(err error, d time.Duration) {
-// 			m.logger.Errorf("Error processing MQTT message: %s/%d. Retrying...", mqttMsg.Topic(), mqttMsg.MessageID())
-// 		}, func() {
-// 			m.logger.Infof("Successfully processed MQTT message after it previously failed: %s/%d", mqttMsg.Topic(), mqttMsg.MessageID())
-// 		}); err != nil {
-// 			m.logger.Errorf("Failed processing MQTT message: %s/%d: %v", mqttMsg.Topic(), mqttMsg.MessageID(), err)
-// 		}
-// 	})
-// 	if err := token.Error(); err != nil {
-// 		m.logger.Errorf("mqtt error from subscribe: %v", err)
+		if err := retry.NotifyRecover(func() error {
+			m.logger.Debugf("Processing MQTT message %s/%d", mqttMsg.Topic(), mqttMsg.MessageID())
+			return m.handleMessage(handler, mqttMsg)
+		}, b, func(err error, d time.Duration) {
+			m.logger.Errorf("Error processing MQTT message: %s/%d. Retrying...", mqttMsg.Topic(), mqttMsg.MessageID())
+		}, func() {
+			m.logger.Infof("Successfully processed MQTT message after it previously failed: %s/%d", mqttMsg.Topic(), mqttMsg.MessageID())
+		}); err != nil {
+			m.logger.Errorf("Failed processing MQTT message: %s/%d: %v", mqttMsg.Topic(), mqttMsg.MessageID(), err)
+		}
+	})
+	if err := token.Error(); err != nil {
+		m.logger.Errorf("mqtt error from subscribe: %v", err)
 
-// 		return err
-// 	}
-// 	<-sigterm
+		return err
+	}
+	<-sigterm
 
-// 	return nil
-// }
+	return nil
+}
 
 //TEST: Mock Read to avoid interactions with mqtt publish client
-func (m *MQTT) Read(handler func(*bindings.ReadResponse) ([]byte, error)) error {
-	m.logger.Debugf("MOCK: mqtt subscribing to topic %s", m.metadata.topic)
-	interval := time.Second
-	for {
-		timer := time.After(interval)
-		<-timer
-		m.logger.Debug("MOCK: invoke Read handler...")
-		msg := bindings.ReadResponse{}
-		if _, err := handler(&msg); err != nil {
-			m.logger.Errorf("MOCK: Read is never expected to terminate with err from handler %s", err)
-			return err
-		}
-	}
-}
+// func (m *MQTT) Read(handler func(*bindings.ReadResponse) ([]byte, error)) error {
+// 	m.logger.Debugf("MOCK: mqtt subscribing to topic %s", m.metadata.topic)
+// 	interval := time.Second
+// 	for {
+// 		timer := time.After(interval)
+// 		<-timer
+// 		m.logger.Debug("MOCK: invoke Read handler...")
+// 		msg := bindings.ReadResponse{}
+// 		if _, err := handler(&msg); err != nil {
+// 			m.logger.Errorf("MOCK: Read is never expected to terminate with err from handler %s", err)
+// 			return err
+// 		}
+// 	}
+// }
 
 func (m *MQTT) connect(clientID string) (mqtt.Client, error) {
 	uri, err := url.Parse(m.metadata.url)
