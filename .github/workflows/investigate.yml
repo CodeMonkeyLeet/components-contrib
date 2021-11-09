@@ -347,6 +347,13 @@ jobs:
         if [[ -v CONFORMANCE_FAILURE ]]; then
           exit 1
         fi
+        # TEST: Flag retries as failures to identify use of retry loop
+        set +e
+        RETRIED="$(cat ${{ env.TEST_OUTPUT_FILE_PREFIX }}_conformance.json | grep Retrying)"
+        echo "$RETRIED"
+        if [ -n "$RETRIED" ]; then
+          exit 1
+        fi
 
     # Upload logs for test analytics to consume
     - name: Upload test results
