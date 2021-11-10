@@ -190,8 +190,8 @@ func (s *SQLServer) Init(metadata state.Metadata) error {
 	if err != nil {
 		return err
 	}
-
-	return nil
+	return fmt.Errorf("FORCED TESTING FAILURE: IGNORE")
+	// return nil
 }
 
 // Returns validated index properties.
